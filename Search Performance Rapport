@@ -1,0 +1,57 @@
+function main() {
+  try {
+    // Indsæt URL til Google Sheet:
+    var spreadsheetUrl = 'https://docs.google.com/spreadsheets/d/1WOaKkBLj-IJDpn_NugWjvPWV90LZsCYUP6SNzGoS-a0/edit?gid=0#gid=0';
+    var sheetName = 'ark1'; // Navngiv alt efter hvad dit ark hedder
+
+    // Åben og hent Google Sheet
+    var spreadsheet = SpreadsheetApp.openByUrl(spreadsheetUrl);
+    var sheet = spreadsheet.getSheetByName(sheetName);
+
+    if (!sheet) {
+      Logger.log('Google sheet blev ikke fundet: ' + sheetName);
+      return;
+    }
+
+    // Rens sheet før der tilskrives nyt data (kan fjernes, hvis dette ikke ønskes)
+    sheet.clear();
+
+    // Indsæt følgende overskrifter som headers i sheet
+    sheet.appendRow(['Campaign Name', 'Ad Group Name', 'Ad ID', 'Impressions', 'Clicks', 'CTR', 'Cost Per Click', 'Conversions', 'Cost Per Conversion']);
+
+    var report = AdsApp.report(
+      "SELECT CampaignName, AdGroupName, Id, Impressions, Clicks, Ctr, Conversions, CostPerConversion, AverageCpc " +
+      "FROM AD_PERFORMANCE_REPORT " +
+      "WHERE Impressions > 0 DURING LAST_30_DAYS");
+
+    var rows = report.rows();
+    while (rows.hasNext()) {
+      var row = rows.next();
+      sheet.appendRow([
+        row['CampaignName'],
+        row['AdGroupName'],
+        row['Id'],
+        row['Impressions'],
+        row['Clicks'],
+        row['Ctr'],
+        row['AverageCpc'],
+        row['Conversions'],
+        row['CostPerConversion']
+      ]);
+    }
+
+    // Tjek om der er data som kan formateres til valuta
+    var lastRow = sheet.getLastRow();
+    if (lastRow > 1) {//Formatere klikpris og konverteringspris til DKk
+      var averageCpcRange = sheet.getRange(2, 7, lastRow - 1); 
+      var costPerConversionRange = sheet.getRange(2, 9, lastRow - 1); 
+
+      averageCpcRange.setNumberFormat('#,##0.00 kr.');
+      costPerConversionRange.setNumberFormat('#,##0.00 kr.');
+    }
+
+    Logger.log('Rapporteringsdata er blevet sendt til Google Sheet. Opdater ark for at se data.');
+  } catch (e) {
+    Logger.log('Der skete en fejl ved uførelse af script: ' + e.message);
+  }
+}
