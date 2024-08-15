@@ -1,0 +1,133 @@
+/**
+ * Display Placement Excluder by Vincent van Pareren
+ *
+ * This script checks all placements and excludes those that match certain terms.
+ * It then adds the excluded placements to a placement exclusion list in Google Ads.
+ * Note: You need to manually apply the exclusion list to the campaigns.
+
+ * Configuration:
+ * - LOG: Enable or disable logging
+ * - EXCLUSIONS_LIST: Name of the exclusion list
+ * - IMPRESSION_THRESHOLD: Minimum number of impressions to consider
+ * - DAYS_TO_CHECK: Number of days to look back
+ * - EXCLUDE_TERMS: Array of terms to exclude. Add terms on a new line, each one between quotes and a comma after like this: "term",
+ * - MATCH_MODE: 'CONTAINS' to find exclude terms anywhere in the URL, 'ENDS_WITH' to find them only at the end
+ */
+
+var config = {
+  LOG: true,
+  EXCLUSIONS_LIST: "Auto Excluded Placements",
+  IMPRESSION_THRESHOLD: 0,
+  DAYS_TO_CHECK: 30,
+  EXCLUDE_TERMS: [
+    ".xyz",
+    ".space",
+    ".work",
+    ".game",
+    ".bio"
+  ],
+  MATCH_MODE: 'ENDS_WITH' // Change to 'CONTAINS' to match anywhere in the URL
+};
+
+function main() {
+  var excludedPlacements = 0;
+  var checkedPlacements = 0;
+  var excludedPlacementUrls = [];
+
+  // Calculate the date range for the report
+  var today = new Date();
+  var startDate = new Date(today.getTime() - (config.DAYS_TO_CHECK * 24 * 60 * 60 * 1000));
+  var formattedToday = Utilities.formatDate(today, AdsApp.currentAccount().getTimeZone(), "yyyyMMdd");
+  var formattedStartDate = Utilities.formatDate(startDate, AdsApp.currentAccount().getTimeZone(), "yyyyMMdd");
+
+  Logger.log("Date range for the report: " + formattedStartDate + " to " + formattedToday);
+
+  // Query the Group Placement View
+  var query = "SELECT campaign.id, ad_group.id, group_placement_view.target_url " +
+              "FROM group_placement_view " +
+              "WHERE group_placement_view.placement_type = 'WEBSITE' " +
+              "AND metrics.impressions > " + config.IMPRESSION_THRESHOLD + " " +
+              "AND segments.date BETWEEN '" + formattedStartDate + "' AND '" + formattedToday + "'";
+
+  Logger.log("Query: " + query);
+
+  var report = AdsApp.report(query);
+  var rows = report.rows();
+
+  if (!rows.hasNext()) {
+    Logger.log("No rows returned from the report.");
+  }
+
+  while (rows.hasNext()) {
+    var row = rows.next();
+    var placementUrl = row['group_placement_view.target_url'];
+    var campaignId = row['campaign.id'];
+    var adGroupId = row['ad_group.id'];
+    checkedPlacements++;
+
+    // Check if the placement URL matches any of the exclude terms
+    for (var i = 0; i < config.EXCLUDE_TERMS.length; i++) {
+      var excludeTerm = config.EXCLUDE_TERMS[i].toLowerCase();
+      var url = placementUrl.toLowerCase();
+      var match = false;
+
+      if (config.MATCH_MODE === 'ENDS_WITH') {
+        match = url.endsWith(excludeTerm);
+      } else {
+        match = url.includes(excludeTerm);
+      }
+
+      if (match) {
+        // Exclude the placement
+        Logger.log("Matched exclude term: " + excludeTerm);
+
+        try {
+          var campaignIterator = AdsApp.campaigns().withIds([campaignId]).get();
+          if (campaignIterator.hasNext()) {
+            var campaign = campaignIterator.next();
+            var adGroupIterator = campaign.adGroups().withIds([adGroupId]).get();
+            if (adGroupIterator.hasNext()) {
+              var adGroup = adGroupIterator.next();
+              // Use the URL to directly exclude it
+              adGroup.display().newPlacementBuilder().withUrl(placementUrl).exclude();
+              excludedPlacements++;
+              excludedPlacementUrls.push(placementUrl);
+              Logger.log("Excluded placement: " + placementUrl);
+
+              // Add the placement to a placement exclusion list
+              var excludedPlacementList = selectExclusionsList(config.EXCLUSIONS_LIST);
+              if (excludedPlacementList) {
+                excludedPlacementList.addExcludedPlacement(placementUrl);
+                Logger.log("Added placement to exclusion list: " + placementUrl);
+              }
+            } else {
+              Logger.log("Ad group not found: " + adGroupId);
+            }
+          } else {
+            Logger.log("Campaign not found: " + campaignId);
+          }
+        } catch (e) {
+          Logger.log("Error excluding placement: " + e.message);
+        }
+
+        break;
+      }
+    }
+  }
+
+  // Log the total number of checked and excluded placements
+  Logger.log("Total placements checked: " + checkedPlacements);
+  Logger.log("Total placements excluded: " + excludedPlacements);
+  Logger.log("Excluded Placements: " + excludedPlacementUrls.join(", "));
+}
+
+function selectExclusionsList(name) {
+  var listIterator = AdsApp.excludedPlacementLists().withCondition("Name = '" + name + "'").get();
+  if (listIterator.hasNext()) {
+    return listIterator.next();
+  } else {
+    return AdsApp.newExcludedPlacementListBuilder().withName(name).build();
+  }
+}
+
+  
