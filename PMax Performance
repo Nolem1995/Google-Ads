@@ -1,0 +1,371 @@
+const SHEET_URL = 'https://docs.google.com/spreadsheets/u/3/d/1yHj9CilZbgGshPFyVZkvjAr9nNtQPQvYfvC8IYJ9nGc/copy';
+const BRANDED_TERM_VARIANTS = ['smec','smarter ecommerce']; //Your branded term(s) - usually brand/shop name and variants
+
+/* ============================== Preferences (Calculation) =============================== */
+
+const ADVERTISING_CHANNEL_TYPE = "PERFORMANCE_MAX"; //DISCOVERY;DISPLAY;HOTEL;LOCAL;LOCAL_SERVICES;MULTI_CHANNEL;PERFORMANCE_MAX;SEARCH;SHOPPING;SMART;TRAVEL;UNKNOWN;UNSPECIFIED;VIDEO 
+const CAMPAIGN_COUNT_LIMIT = 0; //0 = No limit; If your account is big, start with limit like 3 to include only the top 3 campaigns by number of conversions
+const CHECK_SPECIFIC_CAMPAIGN_IDS = []; //[] = Check all campaigns; ["19191919191","1818181818","171717171717"] = a comma separated campaign IDs (one or more) to include in the check. The specified campaign(s) must match the ADVERTISING_CHANNEL_TYPE setting.
+const LOOKUP_INTERVALS_IN_DAYS = 30; //7 for WEEKLY | 14 for BI-WEEKLY | 30 for MONTHLY aggregations
+const COUNT_OF_INTERVALS = 6; //The more intervals, the far you look back in time, but also computation becomes heavier
+const OFFSET_SKIP_LAST_N_DAYS = 0; //Offset number of days to skip, in order to get rougly aligned monthly/weekly views
+
+/* ============================== Preferences (Presentation) =============================== */
+
+let CHART_TYPE = "AREA"; // AREA | STEPPED_AREA | COLUMN // Pick "COLUMN" for less data points in order to get more accurate scientific representation of the aggregated periods.
+const SHOW_DATA_LABELS = false; // true or false
+
+/* ============================== Debug modes =============================== */
+
+const DEBUG_MODE = 0; //0 = Off; 1= On; Limit the number of campaigns analyzed by CAMPAIGN_COUNT_LIMIT before you enable the Debug Mode. This mode will create debug sheets - 2 for each interval. One will contain which campaigns were taken into consideration. The other - the aggregated search term categories from the consumer spotlight.
+const DEBUG_CREATE_SHEET_PER_CAMPAIGN_FOR_LAST_INTERVAL = 0; //CAUTION! Enabling this will create many many sheets. 0 = Off; 1 = On; It will create one sheet PER CAMPAIGN for the last interval only. Each of the sheets will contain the search categories from consumer spotlight.
+
+/* =============================== Execution ================================ */  
+
+let spreadsheetDocument = SpreadsheetApp.openByUrl(SHEET_URL);
+spreadsheetDocument.rename('Search Term Insights by smec v2.0');
+
+function main() {
+    Logger.log(`Welcome to Smarter Ecommerce (smec)! . * ･ ｡ﾟ☆━੧[ ✪ ᗜ ✪ ]⊃ \nWe analyzed your Consumer Spotlight search terms. \nFind the results in the Google Spreadsheet you provided above (SHEET_URL)`);
+  
+    let resultData = [];
+
+    const timeFrames = prepareDateFilter(OFFSET_SKIP_LAST_N_DAYS);
+    for (let k = 0; k < timeFrames.length; k++) {
+
+        let dateFilter = `segments.date BETWEEN '${formatDateForGAQL(timeFrames[k].start)}' AND '${formatDateForGAQL(timeFrames[k].end)}'`;
+      
+        let specificCampaignIdCheck = ``;
+        if (CHECK_SPECIFIC_CAMPAIGN_IDS.length > 0) {
+            let campaignIdList = `"${CHECK_SPECIFIC_CAMPAIGN_IDS[0]}"`;
+            CHECK_SPECIFIC_CAMPAIGN_IDS.forEach(function(campaignId, index){
+                if (index>0) {
+                    campaignIdList += `,"${campaignId}"`;
+                }
+            });
+            specificCampaignIdCheck += ` AND campaign.id IN (${campaignIdList}) `;
+        }          
+        
+        let campaignQuery = `
+        SELECT 
+            campaign.id, 
+            campaign.name, 
+            metrics.clicks, 
+            metrics.impressions, 
+            metrics.conversions, 
+            metrics.conversions_value
+        FROM campaign
+        WHERE 
+            campaign.status != 'REMOVED' 
+            AND campaign.advertising_channel_type = "${ADVERTISING_CHANNEL_TYPE}"            
+            AND metrics.impressions > 0     
+            AND metrics.conversions > 0 
+            ${specificCampaignIdCheck} 
+            AND ${dateFilter}  
+        ORDER BY metrics.conversions DESC    
+        `;
+
+        if (CAMPAIGN_COUNT_LIMIT > 0) {
+            campaignQuery += ` LIMIT ${CAMPAIGN_COUNT_LIMIT}`;
+        }  
+
+        let campaignsData = [];  
+        let searchTermCategoriesData = {}; 
+
+        let campaignIdsQuery = AdsApp.report(campaignQuery);  
+        let rows = campaignIdsQuery.rows();          
+        
+        let campaignsSheet;
+        if (DEBUG_MODE) {
+            campaignsSheet = getOrInsertSheetByName('campaignsAnalyzed_'+formatDateForGAQL(timeFrames[k].start), spreadsheetDocument);
+            campaignsSheet.appendRow(['Campaign Name','Campaign Id','Clicks','Impressions','Conversions','Conversion Value']);      
+        }
+        while (rows.hasNext()) {
+            let row = rows.next();
+            campaignsData.push({id: row['campaign.id'], name: row['campaign.name'], conversions: row['metrics.conversions']});
+            if (DEBUG_MODE) {
+                campaignsSheet.appendRow([row['campaign.name'], row['campaign.id'], row['metrics.clicks'], row['metrics.impressions'], row['metrics.conversions'], row['metrics.conversions_value']]);
+            }
+        }  
+      
+        let resultDataRow = {};
+        resultDataRow["start"] = formatDateForGAQL(timeFrames[k].start);
+        resultDataRow["end"] = formatDateForGAQL(timeFrames[k].end); 
+        resultDataRow["conversions_branded_sum"] = 0; 
+        resultDataRow["conversions_nonbranded_sum"] = 0;
+        resultDataRow["conversions_blank_sum"] = 0;
+        resultDataRow["conv_value_branded_sum"] = 0; 
+        resultDataRow["conv_value_nonbranded_sum"] = 0;    
+        resultDataRow["conv_value_blank_sum"] = 0;    
+        resultDataRow["clicks_branded_sum"] = 0; 
+        resultDataRow["clicks_nonbranded_sum"] = 0; 
+        resultDataRow["clicks_blank_sum"] = 0; 
+        resultDataRow["impressions_branded_sum"] = 0; 
+        resultDataRow["impressions_nonbranded_sum"] = 0;  
+        resultDataRow["impressions_blank_sum"] = 0; 
+        resultDataRow["interactions_branded_sum"] = 0; 
+        resultDataRow["interactions_nonbranded_sum"] = 0;  
+        resultDataRow["interactions_blank_sum"] = 0;                    
+    
+        for (let i = 0; i < campaignsData.length; i++) {
+            let campaignId = campaignsData[i].id; 
+        
+            let STInsightsQuery = AdsApp.report(
+                `
+                SELECT 
+                campaign_search_term_insight.category_label, 
+                metrics.clicks, 
+                metrics.impressions, 
+                metrics.conversions,
+                metrics.conversions_value,
+                metrics.ctr, 
+                metrics.conversions_from_interactions_rate    
+                FROM 
+                campaign_search_term_insight 
+                WHERE               
+                campaign_search_term_insight.campaign_id = '${campaignId}'  
+                AND ${dateFilter}  
+                ORDER BY 
+                metrics.conversions DESC
+                `
+            );
+        
+            let STInsightsRows = STInsightsQuery.rows(); 
+
+            while (STInsightsRows.hasNext()) {
+                let STIrow = STInsightsRows.next();
+
+                if (STIrow['campaign_search_term_insight.category_label']) { //Take into consideration only rows that have a search term/category; excludes unknowns
+                    let hasMatch = false;
+                    BRANDED_TERM_VARIANTS.forEach(function(brandedTerm){
+                        if (STIrow['campaign_search_term_insight.category_label'].toLowerCase().indexOf(brandedTerm.toLowerCase()) >= 0) {
+                            hasMatch = true;  
+                        }
+                    });
+                    if (hasMatch) {
+                        resultDataRow["conversions_branded_sum"] += +Number(STIrow['metrics.conversions']).toFixed(1);
+                        resultDataRow["conv_value_branded_sum"] += +Number(STIrow['metrics.conversions_value']).toFixed(1);
+                        resultDataRow["clicks_branded_sum"] += +Number(STIrow['metrics.clicks']).toFixed(1);
+                        resultDataRow["impressions_branded_sum"] += +Number(STIrow['metrics.impressions']).toFixed(1);
+                        resultDataRow["interactions_branded_sum"] += +(STIrow['metrics.conversions_from_interactions_rate'] ? Number(STIrow['metrics.conversions']) / Number(STIrow['metrics.conversions_from_interactions_rate']) : Number(STIrow['metrics.clicks'])).toFixed(1);                        
+                    } else {
+                        resultDataRow["conversions_nonbranded_sum"] += +Number(STIrow['metrics.conversions']).toFixed(1); 
+                        resultDataRow["conv_value_nonbranded_sum"] += +Number(STIrow['metrics.conversions_value']).toFixed(1); 
+                        resultDataRow["clicks_nonbranded_sum"] += +Number(STIrow['metrics.clicks']).toFixed(1); 
+                        resultDataRow["impressions_nonbranded_sum"] += +Number(STIrow['metrics.impressions']).toFixed(1); 
+                        resultDataRow["interactions_nonbranded_sum"] += +(STIrow['metrics.conversions_from_interactions_rate'] ? Number(STIrow['metrics.conversions']) / Number(STIrow['metrics.conversions_from_interactions_rate']) : Number(STIrow['metrics.clicks'])).toFixed(1);                        
+                    }                               
+                } else {                  
+                    resultDataRow["conversions_blank_sum"] += +Number(STIrow['metrics.conversions']).toFixed(1); 
+                    resultDataRow["conv_value_blank_sum"] += +Number(STIrow['metrics.conversions_value']).toFixed(1); 
+                    resultDataRow["clicks_blank_sum"] += +Number(STIrow['metrics.clicks']).toFixed(1); 
+                    resultDataRow["impressions_blank_sum"] += +Number(STIrow['metrics.impressions']).toFixed(1);  
+                    resultDataRow["interactions_blank_sum"] += +(STIrow['metrics.conversions_from_interactions_rate'] ? Number(STIrow['metrics.conversions']) / Number(STIrow['metrics.conversions_from_interactions_rate']) : Number(STIrow['metrics.clicks'])).toFixed(1);                  
+                }
+
+                if (DEBUG_MODE) {
+                    if (searchTermCategoriesData[STIrow['campaign_search_term_insight.category_label']]) {
+                        searchTermCategoriesData[STIrow['campaign_search_term_insight.category_label']]['conversions'] += Number(STIrow['metrics.conversions']);
+                        searchTermCategoriesData[STIrow['campaign_search_term_insight.category_label']]['impressions'] += Number(STIrow['metrics.impressions']);
+                        searchTermCategoriesData[STIrow['campaign_search_term_insight.category_label']]['clicks'] += Number(STIrow['metrics.clicks']);
+                        searchTermCategoriesData[STIrow['campaign_search_term_insight.category_label']]['conversions_value'] += Number(STIrow['metrics.conversions_value']);              
+                    } else {
+                        if (STIrow['campaign_search_term_insight.category_label']) {
+                            searchTermCategoriesData[STIrow['campaign_search_term_insight.category_label']] = {};
+                            searchTermCategoriesData[STIrow['campaign_search_term_insight.category_label']]['conversions'] = Number(STIrow['metrics.conversions']);
+                            searchTermCategoriesData[STIrow['campaign_search_term_insight.category_label']]['impressions'] = Number(STIrow['metrics.impressions']);
+                            searchTermCategoriesData[STIrow['campaign_search_term_insight.category_label']]['clicks'] = Number(STIrow['metrics.clicks']);    
+                            searchTermCategoriesData[STIrow['campaign_search_term_insight.category_label']]['conversions_value'] = Number(STIrow['metrics.conversions_value']); 
+                        }
+                    } 
+                }           
+            }
+
+            if (DEBUG_CREATE_SHEET_PER_CAMPAIGN_FOR_LAST_INTERVAL) {   
+                let sheet = getOrInsertSheetByName(campaignId, spreadsheetDocument);
+                STInsightsQuery.exportToSheet(sheet);
+            }
+        }
+      
+        resultData.push(resultDataRow);
+    
+        let termsAgregatedPerformanceSheet;
+        if (DEBUG_MODE) {
+            termsAgregatedPerformanceSheet = getOrInsertSheetByName('termsAggregatedTotal_'+formatDateForGAQL(timeFrames[k].start), spreadsheetDocument);
+            termsAgregatedPerformanceSheet.appendRow(['Search Term Insights Category','Clicks','Conversions']);      
+
+            for (const objKey in searchTermCategoriesData) {
+                if (searchTermCategoriesData.hasOwnProperty(objKey)) {
+                    if (DEBUG_MODE) {          
+                        termsAgregatedPerformanceSheet.appendRow([objKey, searchTermCategoriesData[objKey]['clicks'], searchTermCategoriesData[objKey]['conversions']]);
+                    }
+                }
+            }
+        }    
+    }
+  
+    //Output end result
+    let outputSheet = getOrInsertSheetByName("End Result", spreadsheetDocument);
+    
+    outputSheet.appendRow(["Timeframe start date","Timeframe end date","branded conversions","non-branded conversions","blank conversions","branded conv. value","non-branded conv. value","blank conv. value","branded clicks","non-branded clicks","blank clicks","branded impressions","non-branded impressions","blank impressions","ratioBrandedConversions", "ratioBrandedConvValue", "ratioBrandedClicks", "ratioBrandedImpressions", "CtrBranded", "CtrNonBranded", "CtrBlank", "ConvRateBranded", "ConvRateNonBranded", "ConvRateBlank" ]);
+    
+    for (let n = 0; n < resultData.length; n++) {      
+        let ratioBrandConv = resultData[n]['conversions_branded_sum'] / (resultData[n]['conversions_branded_sum'] + resultData[n]['conversions_nonbranded_sum'] + resultData[n]['conversions_blank_sum'] );
+        let ratioBrandConvValue = resultData[n]['conv_value_branded_sum'] / (resultData[n]['conv_value_branded_sum'] + resultData[n]['conv_value_nonbranded_sum'] + resultData[n]['conv_value_blank_sum'] );
+        let ratioBrandClicks = resultData[n]['clicks_branded_sum'] / (resultData[n]['clicks_branded_sum'] + resultData[n]['clicks_nonbranded_sum'] + resultData[n]['clicks_blank_sum'] );
+        let ratioBrandImpr = resultData[n]['impressions_branded_sum'] / (resultData[n]['impressions_branded_sum'] + resultData[n]['impressions_nonbranded_sum'] + resultData[n]['impressions_blank_sum'] );
+      
+        let ctr_branded = resultData[n]['impressions_branded_sum'] ? resultData[n]['clicks_branded_sum'] / resultData[n]['impressions_branded_sum'] : 0;
+        let ctr_non_branded = resultData[n]['impressions_nonbranded_sum'] ? resultData[n]['clicks_nonbranded_sum'] / resultData[n]['impressions_nonbranded_sum'] : 0;
+        let ctr_blank = resultData[n]['impressions_blank_sum'] ? resultData[n]['clicks_blank_sum'] / resultData[n]['impressions_blank_sum'] : 0;
+      
+        let conv_rate_branded = resultData[n]['interactions_branded_sum'] ? resultData[n]['conversions_branded_sum'] / resultData[n]['interactions_branded_sum'] : 0;
+        let conv_rate_non_branded = resultData[n]['interactions_nonbranded_sum'] ? resultData[n]['conversions_nonbranded_sum'] / resultData[n]['interactions_nonbranded_sum'] : 0;
+        let conv_rate_blank = resultData[n]['interactions_blank_sum'] ? resultData[n]['conversions_blank_sum'] / resultData[n]['interactions_blank_sum'] : 0;      
+        
+        outputSheet.appendRow([resultData[n]['start'], resultData[n]['end'], resultData[n]['conversions_branded_sum'], resultData[n]['conversions_nonbranded_sum'], resultData[n]['conversions_blank_sum'], resultData[n]['conv_value_branded_sum'], resultData[n]['conv_value_nonbranded_sum'], resultData[n]['conv_value_blank_sum'], resultData[n]['clicks_branded_sum'], resultData[n]['clicks_nonbranded_sum'], resultData[n]['clicks_blank_sum'], resultData[n]['impressions_branded_sum'], resultData[n]['impressions_nonbranded_sum'], resultData[n]['impressions_blank_sum'], (ratioBrandConv ? ratioBrandConv:0), (ratioBrandConvValue ? ratioBrandConvValue:0), (ratioBrandClicks ? ratioBrandClicks:0), (ratioBrandImpr ? ratioBrandImpr:0), ctr_branded, ctr_non_branded, ctr_blank, conv_rate_branded, conv_rate_non_branded, conv_rate_blank ]);
+    }
+  
+    buildSmecMainChart(outputSheet, "Branded vs non-branded conversions over time", "A1:A"+(1+COUNT_OF_INTERVALS), "C1:E"+(1+COUNT_OF_INTERVALS), 10, 1, 'branded conversions', 'non-branded conversions', 'blank', false);  
+    buildSmecMainChart(outputSheet, "Branded vs non-branded conv. value over time", "A1:A"+(1+COUNT_OF_INTERVALS), "F1:H"+(1+COUNT_OF_INTERVALS), 30, 1, 'branded conv. value', 'non-branded conv. value', 'blank', false);  
+    buildSmecMainChart(outputSheet, "Branded vs non-branded clicks over time", "A1:A"+(1+COUNT_OF_INTERVALS), "I1:K"+(1+COUNT_OF_INTERVALS), 50, 1, 'branded clicks', 'non-branded clicks', 'blank', false);  
+    buildSmecMainChart(outputSheet, "Branded vs non-branded impressions over time", "A1:A"+(1+COUNT_OF_INTERVALS), "L1:N"+(1+COUNT_OF_INTERVALS), 70, 1, 'branded impressions', 'non-branded impressions', 'blank', false);  
+  
+    buildSmecMoreInfoChart(outputSheet, "Share of branded conversions over time", "A1:A"+(1+COUNT_OF_INTERVALS), "O1:O"+(1+COUNT_OF_INTERVALS), 10, 8, 'branded conversions', true);  
+    buildSmecMoreInfoChart(outputSheet, "Share of branded conv. value over time", "A1:A"+(1+COUNT_OF_INTERVALS), "P1:P"+(1+COUNT_OF_INTERVALS), 30, 8, 'branded conv. value', true); 
+    buildSmecMoreInfoChart(outputSheet, "Share of branded clicks over time", "A1:A"+(1+COUNT_OF_INTERVALS), "Q1:Q"+(1+COUNT_OF_INTERVALS), 50, 8, 'branded clicks', true); 
+    buildSmecMoreInfoChart(outputSheet, "Share of branded impressions over time", "A1:A"+(1+COUNT_OF_INTERVALS), "R1:R"+(1+COUNT_OF_INTERVALS), 70, 8, 'branded impressions', true); 
+  
+    CHART_TYPE = "LINE"; //Change chart type for the CTR and conv. rate graphs
+    buildSmecMainChart(outputSheet, "Branded vs non-branded CTR over time", "A1:A"+(1+COUNT_OF_INTERVALS), "S1:U"+(1+COUNT_OF_INTERVALS), 90, 1, 'branded CTR', 'non-branded CTR', 'blank segment CTR', true);    
+    buildSmecMainChart(outputSheet, "Branded vs non-branded Conv. Rate over time", "A1:A"+(1+COUNT_OF_INTERVALS), "V1:X"+(1+COUNT_OF_INTERVALS), 110, 1, 'branded conv. rate', 'non-branded conv. rate', 'blank segment conv. rate', true);      
+  
+    deleteSheet1(spreadsheetDocument);       
+}
+
+function getOrInsertSheetByName(sheetName, spreadsheetDocument) {
+    let resultSheet = spreadsheetDocument.getSheetByName(sheetName);
+    if (!resultSheet) {
+        resultSheet = spreadsheetDocument.insertSheet(sheetName);
+    } else {    
+        let tempSheet = spreadsheetDocument.insertSheet('TempSheet');
+        spreadsheetDocument.deleteSheet(resultSheet);
+        resultSheet = tempSheet.setName(sheetName);   
+    }   
+    return resultSheet;
+}
+
+function formatDateForGAQL(date) {
+    let month = '' + (date.getMonth() + 1);
+    let day = '' + date.getDate();
+    let year = date.getFullYear();
+
+    if (month.length < 2) 
+        month = '0' + month;
+    if (day.length < 2) 
+        day = '0' + day;  
+
+    return [year, month, day].join('-');
+}
+
+function prepareDateFilter(OFFSET_SKIP_LAST_N_DAYS) {
+    const date_filter = [];
+    let today;
+  
+    if (OFFSET_SKIP_LAST_N_DAYS > 0){
+      today = new Date();
+      today.setDate(today.getDate() - OFFSET_SKIP_LAST_N_DAYS);
+    } else {
+      today = new Date();
+    }
+  
+    const oneDayInMilliseconds = 24 * 60 * 60 * 1000;
+    const nDaysInMilliseconds = LOOKUP_INTERVALS_IN_DAYS * oneDayInMilliseconds;     
+
+    for (let i = 1; i <= COUNT_OF_INTERVALS; i++) {
+        const end = new Date();
+        end.setTime(today.getTime() - nDaysInMilliseconds * (i - 1));
+        const start = new Date();
+        start.setTime(end.getTime() - nDaysInMilliseconds);
+        end.setTime(end.getTime() - oneDayInMilliseconds);
+
+        date_filter.push({"start": start, "end": end});
+    }
+
+    const reversedArray = [...date_filter].reverse();
+    return reversedArray;
+}
+function buildSmecMainChart(sheet, title, range1, range2, xPos, yPos, label1, label2, label3, range2_in_percent) {
+    let seriesConfig = {
+        0: {labelInLegend: label1},
+        1: {labelInLegend: label2},
+        2: {labelInLegend: label3} 
+    };
+    if (SHOW_DATA_LABELS) {
+        seriesConfig[0]['dataLabel'] = 'value';
+        seriesConfig[1]['dataLabel'] = 'value';
+        seriesConfig[2]['dataLabel'] = 'value';
+    }  
+  
+    let chartBuilder = sheet.newChart().setChartType(Charts.ChartType[CHART_TYPE]);
+    
+    chartBuilder.addRange(sheet.getRange(range1))
+    if (range2) {
+      if (range2_in_percent) {
+        chartBuilder.addRange(sheet.getRange(range2).setNumberFormat("0.0%"));
+      } else {
+        chartBuilder.addRange(sheet.getRange(range2));
+      }            
+    }   
+  
+    chart = chartBuilder.setOption("title", title)
+    .setOption("subtitle", 'Data: all data in "Consumer Spotlight", incl. the unidentifiable search categories')
+    .setOption("hAxis.title", "Start dates of the aggregated time intervals")
+    .setOption("isStacked", true) 
+    .setOption("pointSize", 5)
+    .setOption("series", seriesConfig)   
+    .setOption("colors", ['#ebbf52','#4d40d2','#BEBEBE'])   
+    .setOption("width", 700)
+    .setPosition(xPos, yPos, 0, 0)
+    .build();
+
+    sheet.insertChart(chart);    
+}
+function buildSmecMoreInfoChart(sheet, title, range1, range2, xPos, yPos, label1, range2_in_percent) {
+    let seriesConfig = {
+        0: {labelInLegend: label1} 
+    }; 
+    if (SHOW_DATA_LABELS) {
+        seriesConfig[0]['dataLabel'] = 'value';
+    }
+  
+    let chartBuilder = sheet.newChart().setChartType(Charts.ChartType[CHART_TYPE]);
+    
+    chartBuilder.addRange(sheet.getRange(range1));
+    if (range2) {
+      if (range2_in_percent) {
+        chartBuilder.addRange(sheet.getRange(range2).setNumberFormat("0.0%"));
+      } else {
+        chartBuilder.addRange(sheet.getRange(range2));
+      }
+    }   
+  
+    chart = chartBuilder.setOption("title", title)
+    .setOption("subtitle", 'Data: all data in "Consumer Spotlight", incl. the unidentifiable search categories')
+    .setOption("hAxis.title", "Start dates of the aggregated time intervals")
+    .setOption("pointSize", 5)
+    .setOption("series", seriesConfig)   
+    .setOption("colors", ['#ebbf52','#4d40d2'])   
+    .setOption("width", 700)
+    .setPosition(xPos, yPos, 0, 0)
+    .build();
+
+    sheet.insertChart(chart);    
+}
+function deleteSheet1(spreadsheetDocument) {
+  let sheet1 = spreadsheetDocument.getSheetByName("Sheet1");
+
+  if (sheet1 != null) {
+    spreadsheetDocument.deleteSheet(sheet1);
+  } 
+}
